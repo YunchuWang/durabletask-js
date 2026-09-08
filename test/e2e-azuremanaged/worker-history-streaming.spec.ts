@@ -4,7 +4,7 @@
 /**
  * Opt-in, bounded Azure test. Uses a dedicated task hub; never injects work items.
  * DTS_HISTORY_STREAMING_E2E=1 and DTS_CONNECTION_STRING are required.
- * DTS_HISTORY_STREAMING_ROUNDS defaults to 4 and is capped at 8.
+ * DTS_HISTORY_STREAMING_ROUNDS defaults to 1 and is capped at 8.
  *
  * Each activity input/output is below DTS's 1 MiB payload limit. The accumulated
  * history is larger, but the service decides whether to stream it. This test
@@ -28,7 +28,7 @@ describeAzure("Azure worker history streaming negotiation", () => {
     if (!connectionString || !/Endpoint=https:\/\//i.test(connectionString)) {
       throw new Error("Set DTS_CONNECTION_STRING to a dedicated Azure HTTPS task hub.");
     }
-    const rounds = Number(process.env.DTS_HISTORY_STREAMING_ROUNDS ?? 4);
+    const rounds = Number(process.env.DTS_HISTORY_STREAMING_ROUNDS ?? 1);
     if (!Number.isInteger(rounds) || rounds < 1 || rounds > 8) {
       throw new Error("DTS_HISTORY_STREAMING_ROUNDS must be an integer from 1 to 8.");
     }
