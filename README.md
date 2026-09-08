@@ -111,7 +111,7 @@ You can find more samples in the [examples/azure-managed](./examples/azure-manag
 
 Workers retry completion responses for orchestrations, activities, and entities, including
 version-mismatch failure and abandon responses. The policy follows the .NET worker: ten total
-attempts for `UNAVAILABLE`, `UNKNOWN`, `DEADLINE_EXCEEDED`, or `INTERNAL`, with exponential
+SDK attempts for `UNAVAILABLE`, `UNKNOWN`, `DEADLINE_EXCEEDED`, or `INTERNAL`, with exponential
 backoff starting at 200 ms, capped at 15 seconds before adding 0-20% jitter. Other errors and
 exhausted attempts are reported through the existing worker error logs.
 
@@ -124,9 +124,12 @@ completion during the existing graceful-shutdown window (`shutdownTimeoutMs`, de
 remaining completion RPCs are cancelled when that window expires. Replaced worker channels stay
 open until their pending work finishes or shutdown forces cleanup.
 
-To avoid multiplying retry budgets, worker-created channels disable gRPC transport retries even
-when channel options or an Azure-managed service config enable them. The worker's own hello/stream
-reconnect loop remains active. Client channels and Azure-managed client retry configuration are unchanged.
+Existing channel options and Azure-managed transport retry configuration are preserved, matching
+the .NET Azure-managed worker. Each SDK attempt can therefore contain additional gRPC transport
+retries: ten SDK attempts is not a ten-network-attempt guarantee. For example, a channel policy
+allowing five attempts can produce up to fifty attempts across the two configured retry layers.
+Configure channel retries with that combined budget in mind. The worker's hello/stream reconnect
+loop and client retry behavior remain unchanged.
 
 ### Reusing orchestration instance IDs
 

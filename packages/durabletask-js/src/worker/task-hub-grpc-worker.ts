@@ -66,7 +66,7 @@ type WorkItemStreamResult = {
 export interface TaskHubGrpcWorkerOptions {
   /** The host address to connect to. Defaults to "localhost:4001". */
   hostAddress?: string;
-  /** gRPC channel options. Transport retries are disabled; the worker owns reconnect and response delivery retries. */
+  /** gRPC channel options. */
   options?: grpc.ChannelOptions;
   /** Whether to use TLS. Defaults to false. */
   useTLS?: boolean;
@@ -214,8 +214,7 @@ export class TaskHubGrpcWorker {
     this._registry = new Registry();
     this._hostAddress = resolvedHostAddress;
     this._tls = resolvedUseTLS;
-    // The worker owns the retry budget, including when an Azure-managed service config is supplied.
-    this._grpcChannelOptions = { ...resolvedOptions, "grpc.enable_retries": 0 };
+    this._grpcChannelOptions = resolvedOptions;
     this._grpcChannelCredentials = resolvedCredentials;
     this._metadataGenerator = resolvedMetadataGenerator;
     this._responseStream = null;
@@ -955,7 +954,7 @@ export class TaskHubGrpcWorker {
     const backoff = new ExponentialBackoff({
       initialDelayMs: 200,
       maxDelayMs: 15000,
-      maxAttempts: 9, // Ten total attempts, including the initial delivery.
+      maxAttempts: 9, // Ten SDK attempts; each call retains any configured gRPC transport retries.
       jitterStrategy: "positive",
       jitterFactor: 0.2,
     });

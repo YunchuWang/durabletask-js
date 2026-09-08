@@ -172,7 +172,7 @@ describe("Worker response delivery over gRPC", () => {
     expect(logger.error).toHaveBeenCalledTimes(1);
   });
 
-  it("caps delivery at ten server calls even with all-method channel retries configured", async () => {
+  it("bounds SDK delivery to ten attempts while preserving configured transport retries", async () => {
     const wait = ExponentialBackoff.prototype.wait;
     jest.spyOn(ExponentialBackoff.prototype, "wait").mockImplementation(function (
       this: ExponentialBackoff,
@@ -214,12 +214,14 @@ describe("Worker response delivery over gRPC", () => {
         },
       },
     );
+    const sdkDeliveries = jest.spyOn(worker!["_stub"]!, "completeActivityTask");
     stream.write(activityWorkItem());
     expect(await withTimeout(terminalError.promise, 5000)).toContain("INTERNAL");
     await drainWork();
 
-    expect(requests).toHaveLength(10);
-    expect(transportAttempts).toEqual(Array.from({ length: 10 }, () => []));
+    expect(sdkDeliveries).toHaveBeenCalledTimes(10);
+    expect(requests).toHaveLength(50);
+    expect(transportAttempts).toEqual(Array.from({ length: 10 }, () => [[], ["1"], ["2"], ["3"], ["4"]]).flat());
     expect(requests.every((request) => request.getCompletiontoken() === "delivery-token")).toBe(true);
     expect(requests.every((request) => request.getResult()?.getValue() === '"activity-result"')).toBe(true);
     expect(activity).toHaveBeenCalledTimes(1);
