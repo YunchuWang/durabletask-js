@@ -473,6 +473,46 @@ describe("Worker history streaming over gRPC", () => {
     },
   );
 
+  it.each([false, true])(
+    "stops pending abandonment metadata before late settlement (reject=%s)",
+    async (rejectMetadata) => {
+      await start();
+      let releaseMetadata!: () => void;
+      const metadata = new Promise<grpc.Metadata>((resolve, reject) => {
+        releaseMetadata = () => {
+          if (rejectMetadata) reject(new Error("late abandonment metadata failure"));
+          else resolve(new grpc.Metadata());
+        };
+      });
+      const getMetadata = jest.fn(() => metadata).mockResolvedValueOnce(new grpc.Metadata());
+      worker["_metadataGenerator"] = getMetadata;
+      onHistory = (call) => {
+        call.emit("error", Object.assign(new Error("history unavailable"), { code: grpc.status.UNAVAILABLE }));
+      };
+      const abandon = jest.spyOn(stubs.TaskHubSidecarServiceClient.prototype, "abandonTaskOrchestratorWorkItem");
+      const execute = jest.spyOn(OrchestrationExecutor.prototype, "execute");
+      try {
+        send(request());
+        await waitFor(() => getMetadata.mock.calls.length === 2);
+        expect(historyCalls).toHaveLength(1);
+        expect(worker["_pendingWorkItems"].size).toBe(1);
+        worker["_shutdownTimeoutMs"] = 50;
+        await worker.stop();
+        expect(worker["_pendingWorkItems"].size).toBe(0);
+        expect(worker["_historyCancellations"].size).toBe(0);
+        expect(abandon).not.toHaveBeenCalled();
+        expect(execute).not.toHaveBeenCalled();
+        expect(responses).toHaveLength(0);
+      } finally {
+        releaseMetadata();
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(abandon).not.toHaveBeenCalled();
+      expect(abandonments).toHaveLength(0);
+      expect(worker["_pendingWorkItems"].size).toBe(0);
+    },
+  );
+
   it("abandons on metadata failure without using inline history", async () => {
     await start();
     worker["_metadataGenerator"] = jest
