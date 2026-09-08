@@ -997,6 +997,12 @@ export class TaskHubGrpcWorker {
       try {
         const pastEvents = await this._streamOrchestrationHistory(req, stub, signal);
         signal?.throwIfAborted();
+        if (
+          !pastEvents.some((event) => event.hasExecutionstarted()) &&
+          !req.getNeweventsList().some((event) => event.hasExecutionstarted())
+        ) {
+          throw new Error("The provided orchestration history was incomplete (missing ExecutionStarted).");
+        }
         req.setPasteventsList(pastEvents);
       } catch (error) {
         // Incomplete history is a work-item transport failure, not an orchestration failure.

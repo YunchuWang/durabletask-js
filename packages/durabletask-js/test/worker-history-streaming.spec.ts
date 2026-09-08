@@ -265,6 +265,52 @@ describe("Worker history streaming over gRPC", () => {
     expectStreamCleanedUp();
   });
 
+  it.each<[VersionMatchStrategy, boolean]>([
+    [VersionMatchStrategy.None, false],
+    [VersionMatchStrategy.Strict, false],
+    [VersionMatchStrategy.None, true],
+    [VersionMatchStrategy.Strict, true],
+  ])("abandons OK history missing ExecutionStarted (strategy=%s, nonempty=%s)", async (matchStrategy, nonempty) => {
+    worker["_versioning"] = { version: "1", matchStrategy, failureStrategy: VersionFailureStrategy.Fail };
+    worker.addOrchestrator(async function* resumedHistory(ctx: OrchestrationContext, input: number): AsyncGenerator {
+      return yield ctx.callActivity("echo", input);
+    });
+    const pastEvents = [
+      pbh.newOrchestratorStartedEvent(),
+      pbh.newExecutionStartedEvent("resumedHistory", instanceId, "7", undefined, executionId, "1"),
+      pbh.newTaskScheduledEvent(1, "echo", "7"),
+    ];
+    const req = request()
+      .setPasteventsList(pastEvents)
+      .setNeweventsList([pbh.newOrchestratorStartedEvent(), pbh.newTaskCompletedEvent(1, "14")]);
+    onHistory = (call) => {
+      if (nonempty) call.write(chunk([pastEvents[2]]));
+      call.end();
+    };
+    const execute = jest.spyOn(OrchestrationExecutor.prototype, "execute");
+    await start();
+    send(req);
+    await waitFor(() => responses.length > 0 || abandonments.length > 0);
+    await settled();
+    expect(abandonments.map((item) => item.getCompletiontoken())).toEqual(["history-token"]);
+    expect(responses).toHaveLength(0);
+    expect(execute).not.toHaveBeenCalled();
+    expect(exporter.getFinishedSpans()).toHaveLength(0);
+    expectStreamCleanedUp();
+
+    onHistory = (call) => {
+      call.write(chunk(pastEvents));
+      call.end();
+    };
+    send(req, "complete-history-redelivery");
+    await waitFor(() => responses.length > 0);
+    await settled();
+    expect(responses[0].getCompletiontoken()).toBe("complete-history-redelivery");
+    const completed = responses[0].getActionsList()[0].getCompleteorchestration()!;
+    expect(completed.getOrchestrationstatus()).toBe(pb.OrchestrationStatus.ORCHESTRATION_STATUS_COMPLETED);
+    expect(completed.getResult()!.getValue()).toBe("14");
+  });
+
   it.each([grpc.status.UNAVAILABLE, grpc.status.CANCELLED])(
     "abandons incomplete history on gRPC status %s",
     async (code) => {
@@ -355,29 +401,35 @@ describe("Worker history streaming over gRPC", () => {
     expectStreamCleanedUp();
   });
 
-  it("does not open a history stream after stop while metadata was pending", async () => {
-    await start();
-    let releaseMetadata!: (metadata: grpc.Metadata) => void;
-    const metadata = new Promise<grpc.Metadata>((resolve) => {
-      releaseMetadata = resolve;
-    });
-    const getMetadata = jest.fn(() => metadata);
-    worker["_metadataGenerator"] = getMetadata;
-    const execute = jest.spyOn(OrchestrationExecutor.prototype, "execute");
-    send(request());
-    await waitFor(() => getMetadata.mock.calls.length > 0);
-    worker["_shutdownTimeoutMs"] = 50;
-    await worker.stop();
-    expect(historyCalls).toHaveLength(0);
-    expect(execute).not.toHaveBeenCalled();
-    expect(responses).toHaveLength(0);
-    expect(worker["_pendingWorkItems"].size).toBe(0);
-    expect(worker["_historyCancellations"].size).toBe(0);
-    releaseMetadata(new grpc.Metadata());
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(historyCalls).toHaveLength(0);
-    expect(abandonments).toHaveLength(0);
-  });
+  it.each([false, true])(
+    "stops pending metadata hydration before late settlement (reject=%s)",
+    async (rejectMetadata) => {
+      await start();
+      let releaseMetadata!: () => void;
+      const metadata = new Promise<grpc.Metadata>((resolve, reject) => {
+        releaseMetadata = () => {
+          if (rejectMetadata) reject(new Error("late metadata failure"));
+          else resolve(new grpc.Metadata());
+        };
+      });
+      const getMetadata = jest.fn(() => metadata);
+      worker["_metadataGenerator"] = getMetadata;
+      const execute = jest.spyOn(OrchestrationExecutor.prototype, "execute");
+      send(request());
+      await waitFor(() => getMetadata.mock.calls.length > 0);
+      worker["_shutdownTimeoutMs"] = 50;
+      await worker.stop();
+      expect(historyCalls).toHaveLength(0);
+      expect(execute).not.toHaveBeenCalled();
+      expect(responses).toHaveLength(0);
+      expect(worker["_pendingWorkItems"].size).toBe(0);
+      expect(worker["_historyCancellations"].size).toBe(0);
+      releaseMetadata();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(historyCalls).toHaveLength(0);
+      expect(abandonments).toHaveLength(0);
+    },
+  );
 
   it("abandons on metadata failure without using inline history", async () => {
     await start();
