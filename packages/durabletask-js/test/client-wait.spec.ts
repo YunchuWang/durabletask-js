@@ -188,6 +188,23 @@ describe.each([
     expect(jest.getTimerCount()).toBe(0);
   });
 
+  it("observes a late metadata rejection after cancellation without changing the reason", async () => {
+    let rejectMetadata!: (reason: Error) => void;
+    metadataGenerator.mockImplementation(() => new Promise((_, reject) => (rejectMetadata = reject)));
+    const controller = new AbortController();
+    const reason = { message: "caller cancellation" };
+    const result = wait("instance", undefined, 1, controller.signal);
+    controller.abort(reason);
+    await expect(result).rejects.toBe(reason);
+
+    rejectMetadata(new Error("late credential failure"));
+    await jest.advanceTimersByTimeAsync(1000);
+    await expect(result).rejects.toBe(reason);
+    expect(rpc).not.toHaveBeenCalled();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   it("ignores a response arriving after the timeout", async () => {
     const result = wait("instance", undefined, 1);
     const assertion = expect(result).rejects.toBeInstanceOf(TimeoutError);
@@ -259,6 +276,44 @@ describe.each([
       expect(jest.getTimerCount()).toBe(0);
     });
   } else {
+    it("preserves exponential deadline backoff from 100ms up to the 1s cap", async () => {
+      rpc.mockImplementation((_req, _metadata, cb) => {
+        cb(grpcError(grpc.status.DEADLINE_EXCEEDED), new pb.GetInstanceResponse());
+        return call;
+      });
+      const result = wait("instance", undefined, 3);
+      const assertion = expect(result).rejects.toBeInstanceOf(TimeoutError);
+      await jest.advanceTimersByTimeAsync(0);
+      let attempts = 1;
+      for (const delay of [100, 200, 400, 800, 1000]) {
+        await jest.advanceTimersByTimeAsync(delay - 1);
+        expect(rpc).toHaveBeenCalledTimes(attempts);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(rpc).toHaveBeenCalledTimes(++attempts);
+      }
+      await jest.advanceTimersByTimeAsync(500);
+      await assertion;
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it("keeps the total timeout while a retry waits for metadata", async () => {
+      let resolveMetadata!: (metadata: grpc.Metadata) => void;
+      metadataGenerator
+        .mockResolvedValueOnce(new grpc.Metadata())
+        .mockImplementation(() => new Promise((resolve) => (resolveMetadata = resolve)));
+      const result = wait("instance", undefined, 1);
+      const assertion = expect(result).rejects.toBeInstanceOf(TimeoutError);
+      await jest.advanceTimersByTimeAsync(500);
+      callback(grpcError(grpc.status.DEADLINE_EXCEEDED), new pb.GetInstanceResponse());
+      await jest.advanceTimersByTimeAsync(500);
+      await assertion;
+      expect(metadataGenerator).toHaveBeenCalledTimes(2);
+      resolveMetadata(new grpc.Metadata());
+      await jest.advanceTimersByTimeAsync(0);
+      expect(rpc).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
     it("does not treat metadata failures with a deadline code as server deadlines", async () => {
       const error = grpcError(grpc.status.DEADLINE_EXCEEDED);
       metadataGenerator.mockRejectedValue(error);

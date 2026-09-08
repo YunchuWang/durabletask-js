@@ -338,7 +338,13 @@ export class TaskHubGrpcClient {
     req.setInstanceid(instanceId);
     req.setGetinputsandoutputs(fetchPayloads);
 
-    const res = await this._waitForInstance(req, "start", timeout, signal);
+    const res = await this._withWaitCancellation(
+      timeout,
+      signal,
+      `Timed out waiting for orchestration '${instanceId}' to start after ${timeout}s`,
+      (waitSignal) =>
+        callWithMetadata(this._stub.waitForInstanceStart.bind(this._stub), req, this._metadataGenerator, waitSignal),
+    );
 
     return newOrchestrationState(req.getInstanceid(), res);
   }
@@ -375,7 +381,12 @@ export class TaskHubGrpcClient {
 
     ClientLogs.waitingForInstanceCompletion(this._logger, instanceId);
 
-    const res = await this._waitForInstance(req, "complete", timeout, signal);
+    const res = await this._withWaitCancellation(
+      timeout,
+      signal,
+      `Timed out waiting for orchestration '${instanceId}' to complete after ${timeout}s`,
+      (waitSignal) => this._waitForCompletion(req, waitSignal),
+    );
 
     const state = newOrchestrationState(req.getInstanceid(), res);
 
@@ -397,75 +408,60 @@ export class TaskHubGrpcClient {
     return state;
   }
 
-  private async _waitForInstance(
-    req: pb.GetInstanceRequest,
-    target: "start" | "complete",
+  private async _waitForCompletion(req: pb.GetInstanceRequest, signal: AbortSignal): Promise<pb.GetInstanceResponse> {
+    const backoff = new ExponentialBackoff({ initialDelayMs: 100, maxDelayMs: 1000, jitterFactor: 0 });
+    while (true) {
+      signal.throwIfAborted();
+      // Metadata failures must not enter the remote-deadline retry path.
+      const metadata = this._metadataGenerator ? await this._metadataGenerator() : new grpc.Metadata();
+      try {
+        return await callWithMetadata(
+          this._stub.waitForInstanceCompletion.bind(this._stub),
+          req,
+          async () => metadata,
+          signal,
+        );
+      } catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof Error && "code" in error && error.code === grpc.status.DEADLINE_EXCEEDED) {
+          await backoff.wait(signal);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async _withWaitCancellation(
     timeout: number,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    timeoutMessage: string,
+    wait: (signal: AbortSignal) => Promise<pb.GetInstanceResponse>,
   ): Promise<pb.GetInstanceResponse> {
     const timeoutMs = timeout * 1000;
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new RangeError(`timeoutMs must be a finite number >= 0, got ${timeoutMs}`);
     }
-    if (signal?.aborted) {
-      throw signal.reason;
-    }
+    signal?.throwIfAborted();
 
     const controller = new AbortController();
-    const onAbort = () => controller.abort(signal?.reason);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    let onWaitAborted = () => {};
-    const aborted = new Promise<never>((_, reject) => {
-      onWaitAborted = () => reject(controller.signal.reason);
-      controller.signal.addEventListener("abort", onWaitAborted, { once: true });
-    });
-    // One timer owns the entire wait, not each long-poll attempt.
-    const timer = setTimeout(() => {
-      controller.abort(
-        new TimeoutError(
-          `Timed out waiting for orchestration '${req.getInstanceid()}' to ${target} after ${timeout}s`,
-        ),
-      );
-    }, timeoutMs);
-
-    const method =
-      target === "start"
-        ? this._stub.waitForInstanceStart.bind(this._stub)
-        : this._stub.waitForInstanceCompletion.bind(this._stub);
-    const poll = async (): Promise<pb.GetInstanceResponse> => {
-      const backoff = new ExponentialBackoff({ initialDelayMs: 100, maxDelayMs: 1000, jitterFactor: 0 });
-      while (true) {
-        if (controller.signal.aborted) {
-          throw controller.signal.reason;
-        }
-        // Credential/metadata failures are not remote wait deadlines and must not be retried.
-        const metadata = this._metadataGenerator ? await this._metadataGenerator() : new grpc.Metadata();
-        try {
-          return await callWithMetadata(method, req, async () => metadata, controller.signal);
-        } catch (error) {
-          if (controller.signal.aborted) {
-            throw controller.signal.reason;
-          }
-          if (
-            target !== "complete" ||
-            !(error instanceof Error) ||
-            !("code" in error) ||
-            error.code !== grpc.status.DEADLINE_EXCEEDED
-          ) {
-            throw error;
-          }
-          await backoff.wait(controller.signal);
-        }
-      }
-    };
-
+    let onAbort = () => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      // Metadata generators cannot be cancelled, so also race them against the wait's signal.
-      return await Promise.race([poll(), aborted]);
+      return await new Promise<pb.GetInstanceResponse>((resolve, reject) => {
+        const cancel = (reason: unknown) => {
+          // Settle even if metadata is still pending, then stop any RPC or backoff.
+          reject(reason);
+          controller.abort(reason);
+        };
+        onAbort = () => cancel(signal?.reason);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        timer = setTimeout(() => cancel(new TimeoutError(timeoutMessage)), timeoutMs);
+        wait(controller.signal).then(resolve, reject);
+      });
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      controller.signal.removeEventListener("abort", onWaitAborted);
     }
   }
 
