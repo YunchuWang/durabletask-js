@@ -122,7 +122,8 @@ redeliver work after a lock expires or an acknowledgement is lost.
 `stop()` cancels retry delays and retried RPCs. Already-running work can still send its first
 completion during the existing graceful-shutdown window (`shutdownTimeoutMs`, default 30 seconds);
 remaining completion RPCs are cancelled when that window expires. Replaced worker channels stay
-open until their pending work finishes or shutdown forces cleanup.
+open until their pending work finishes or shutdown forces cleanup. Cancellation also stops waiting
+for response metadata. A metadata generator may continue running, but its late result cannot start an RPC.
 
 Existing channel options and Azure-managed transport retry configuration are preserved, matching
 the .NET Azure-managed worker. Each SDK attempt can therefore contain additional gRPC transport

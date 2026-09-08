@@ -205,6 +205,72 @@ describe("Worker response delivery", () => {
     expect(method).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["initial", "retry"] as const)("cancels pending %s metadata at its shutdown boundary", async (phase) => {
+    let resolveMetadata!: (metadata: grpc.Metadata) => void;
+    const heldMetadata = new Promise<grpc.Metadata>((resolve) => (resolveMetadata = resolve));
+    const metadataGenerator = jest.fn(() => heldMetadata);
+    if (phase === "retry") metadataGenerator.mockResolvedValueOnce(new grpc.Metadata());
+    const logger = createLogger();
+    const worker = new TaskHubGrpcWorker({ logger, metadataGenerator, shutdownTimeoutMs: 1000 });
+    const activity = jest.fn(() => "activity-result");
+    worker.addNamedActivity("metadataActivity", activity);
+    const completion = new AbortController();
+    const retry = new AbortController();
+    worker["_isRunning"] = true;
+    worker["_stub"] = stub;
+    worker["_completionAbortController"] = completion;
+    worker["_abortController"] = retry;
+    worker["_responseDeliverySignals"].set(stub, { completion: completion.signal, retry: retry.signal });
+    const method = jest
+      .spyOn(stub, "completeActivityTask")
+      .mockImplementation(
+        (
+          _response,
+          _metadata,
+          optionsOrCallback: Partial<grpc.CallOptions> | CompleteCallback,
+          callback?: CompleteCallback,
+        ) => {
+          const respond = typeof optionsOrCallback === "function" ? optionsOrCallback : callback!;
+          respond(grpcError(grpc.status.INTERNAL), new pb.CompleteTaskResponse());
+          return unaryCall();
+        },
+      );
+    const request = new pb.ActivityRequest()
+      .setName("metadataActivity")
+      .setOrchestrationinstance(new pb.OrchestrationInstance().setInstanceid("metadata-instance"));
+    worker["_executeActivity"](request, "metadata-token", stub);
+    await jest.advanceTimersByTimeAsync(200);
+    expect(metadataGenerator).toHaveBeenCalledTimes(phase === "initial" ? 1 : 2);
+    expect(worker["_pendingWorkItems"].size).toBe(1);
+
+    const stopping = worker.stop();
+    try {
+      await jest.advanceTimersByTimeAsync(0);
+      if (phase === "initial") {
+        await jest.advanceTimersByTimeAsync(999);
+        expect(completion.signal.aborted).toBe(false);
+        expect(worker["_pendingWorkItems"].size).toBe(1);
+        await jest.advanceTimersByTimeAsync(1);
+      }
+      expect(worker["_pendingWorkItems"].size).toBe(0);
+      expect(worker["_pendingWorkItemsByStub"].get(stub)?.size).toBe(0);
+      expect(getEventListeners(completion.signal, "abort")).toHaveLength(0);
+      expect(getEventListeners(retry.signal, "abort")).toHaveLength(0);
+
+      resolveMetadata(new grpc.Metadata());
+      await jest.runAllTimersAsync();
+      await stopping;
+      expect(method).toHaveBeenCalledTimes(phase === "initial" ? 0 : 1);
+      expect(activity).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledTimes(phase === "initial" ? 1 : 0);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      resolveMetadata(new grpc.Metadata());
+      await jest.runAllTimersAsync();
+      await stopping;
+    }
+  });
+
   it("retains the original stub until its pending work has delivered its response", async () => {
     const worker = new TaskHubGrpcWorker({ logger: new NoOpLogger() });
     const close = jest.spyOn(stub, "close");

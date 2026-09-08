@@ -265,6 +265,59 @@ describe("Worker response delivery over gRPC", () => {
     expect(worker!["_stub"]!.getChannel().getConnectivityState(false)).toBe(grpc.connectivityState.SHUTDOWN);
   });
 
+  it.each(["initial", "retry"] as const)("stop settles pending %s metadata without a late RPC", async (phase) => {
+    const metadata = deferred<grpc.Metadata>();
+    const metadataWaiting = deferred();
+    let holdMetadata = false;
+    let received = 0;
+    const stream = await startWorker(
+      {
+        completeActivityTask: (call, callback) => {
+          received++;
+          holdMetadata = true;
+          call.sendMetadata(new grpc.Metadata());
+          callback(grpcError(grpc.status.INTERNAL));
+        },
+      },
+      {
+        shutdownTimeoutMs: phase === "initial" ? 100 : 3000,
+        metadataGenerator: async () => {
+          if (holdMetadata) {
+            metadataWaiting.resolve();
+            return metadata.promise;
+          }
+          return new grpc.Metadata();
+        },
+      },
+    );
+    holdMetadata = phase === "initial";
+    const send = jest.spyOn(worker!["_stub"]!, "completeActivityTask");
+    stream.write(activityWorkItem());
+    await withTimeout(metadataWaiting.promise, 5000);
+    const pending = Promise.all(worker!["_pendingWorkItems"]);
+    const stopping = worker!.stop();
+    try {
+      if (phase === "initial") {
+        await withTimeout(shutdownWaiting.promise, 5000);
+        expect(worker!["_completionAbortController"]!.signal.aborted).toBe(false);
+        expect(worker!["_pendingWorkItems"].size).toBe(1);
+      }
+      await withTimeout(pending, 1000, "Metadata wait did not settle on cancellation");
+      await withTimeout(stopping, 5000);
+      await drainWork();
+
+      metadata.resolve(new grpc.Metadata());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(send).toHaveBeenCalledTimes(phase === "initial" ? 0 : 1);
+      expect(received).toBe(phase === "initial" ? 0 : 1);
+      expect(activity).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledTimes(phase === "initial" ? 1 : 0);
+    } finally {
+      metadata.resolve(new grpc.Metadata());
+      await withTimeout(stopping, 5000);
+    }
+  });
+
   it("graceful stop retains the stub until running activity work sends its initial completion", async () => {
     const started = deferred();
     const finishActivity = deferred<string>();
