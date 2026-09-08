@@ -15,6 +15,8 @@ import { OrchestrationState } from "../orchestration/orchestration-state";
 import { GrpcClient } from "./client-grpc";
 import { OrchestrationStatus, toProtobuf, fromProtobuf } from "../orchestration/enum/orchestration-status.enum";
 import { raceWithTimeout } from "../utils/timeout.util";
+import { TimeoutError } from "../exception/timeout-error";
+import { ExponentialBackoff } from "../utils/backoff.util";
 import { PurgeResult } from "../orchestration/orchestration-purge-result";
 import { PurgeInstanceCriteria } from "../orchestration/orchestration-purge-criteria";
 import { PurgeInstanceOptions } from "../orchestration/orchestration-purge-options";
@@ -320,7 +322,9 @@ export class TaskHubGrpcClient {
    * @param {string} instanceId - The unique identifier of the orchestrator instance to wait for.
    * @param {boolean} fetchPayloads - Indicates whether to fetch the orchestrator instance's
    *                                  inputs, outputs (true) or omit them (false).
-   * @param {number} timeout - The amount of time, in seconds, to wait for the orchestrator instance to start.
+   * @param {number} timeout - The total time, in seconds, to wait, including metadata generation. Defaults to 60.
+   * @param {AbortSignal} signal - Optional cancellation signal. Rejects with its reason without terminating the orchestration.
+   * @throws {TimeoutError} If the timeout expires. The pending RPC is cancelled.
    * @returns {Promise<OrchestrationState | undefined>} A Promise that resolves to the orchestrator instance metadata
    *                                               or undefined if no such instance is found.
    */
@@ -328,23 +332,13 @@ export class TaskHubGrpcClient {
     instanceId: string,
     fetchPayloads: boolean = false,
     timeout: number = 60,
+    signal?: AbortSignal,
   ): Promise<OrchestrationState | undefined> {
     const req = new pb.GetInstanceRequest();
     req.setInstanceid(instanceId);
     req.setGetinputsandoutputs(fetchPayloads);
 
-    const callPromise = callWithMetadata<pb.GetInstanceRequest, pb.GetInstanceResponse>(
-      this._stub.waitForInstanceStart.bind(this._stub),
-      req,
-      this._metadataGenerator,
-    );
-
-    // Execute the request and wait for the first response or timeout
-    const res = await raceWithTimeout(
-      callPromise,
-      timeout * 1000,
-      () => `Timed out waiting for orchestration '${instanceId}' to start after ${timeout}s`,
-    );
+    const res = await this._waitForInstance(req, "start", timeout, signal);
 
     return newOrchestrationState(req.getInstanceid(), res);
   }
@@ -357,12 +351,15 @@ export class TaskHubGrpcClient {
    * A "completed" orchestrator instance refers to any instance in one of the terminal states.
    * For example, the Completed, Failed, or Terminated states.
    *
-   * If a orchestrator instance is already running when this method is called, it returns immediately.
+   * If an orchestrator instance is already in a terminal state when this method is called, it returns immediately.
+   * Server deadline errors are retried with backoff within the original total timeout.
    *
    * @param {string} instanceId - The unique identifier of the orchestrator instance to wait for.
    * @param {boolean} fetchPayloads - Indicates whether to fetch the orchestrator instance's
    *                                  inputs, outputs (true) or omit them (false).
-   * @param {number} timeout - The amount of time, in seconds, to wait for the orchestrator instance to start.
+   * @param {number} timeout - The total time, in seconds, to wait, including metadata generation and retries. Defaults to 60.
+   * @param {AbortSignal} signal - Optional cancellation signal. Rejects with its reason without terminating the orchestration.
+   * @throws {TimeoutError} If the timeout expires. The pending RPC is cancelled.
    * @returns {Promise<OrchestrationState | undefined>} A Promise that resolves to the orchestrator instance metadata
    *                                               or undefined if no such instance is found.
    */
@@ -370,6 +367,7 @@ export class TaskHubGrpcClient {
     instanceId: string,
     fetchPayloads: boolean = true,
     timeout: number = 60,
+    signal?: AbortSignal,
   ): Promise<OrchestrationState | undefined> {
     const req = new pb.GetInstanceRequest();
     req.setInstanceid(instanceId);
@@ -377,18 +375,7 @@ export class TaskHubGrpcClient {
 
     ClientLogs.waitingForInstanceCompletion(this._logger, instanceId);
 
-    const callPromise = callWithMetadata<pb.GetInstanceRequest, pb.GetInstanceResponse>(
-      this._stub.waitForInstanceCompletion.bind(this._stub),
-      req,
-      this._metadataGenerator,
-    );
-
-    // Execute the request and wait for the first response or timeout
-    const res = await raceWithTimeout(
-      callPromise,
-      timeout * 1000,
-      () => `Timed out waiting for orchestration '${instanceId}' to complete after ${timeout}s`,
-    );
+    const res = await this._waitForInstance(req, "complete", timeout, signal);
 
     const state = newOrchestrationState(req.getInstanceid(), res);
 
@@ -408,6 +395,78 @@ export class TaskHubGrpcClient {
     }
 
     return state;
+  }
+
+  private async _waitForInstance(
+    req: pb.GetInstanceRequest,
+    target: "start" | "complete",
+    timeout: number,
+    signal?: AbortSignal,
+  ): Promise<pb.GetInstanceResponse> {
+    const timeoutMs = timeout * 1000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new RangeError(`timeoutMs must be a finite number >= 0, got ${timeoutMs}`);
+    }
+    if (signal?.aborted) {
+      throw signal.reason;
+    }
+
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    let onWaitAborted = () => {};
+    const aborted = new Promise<never>((_, reject) => {
+      onWaitAborted = () => reject(controller.signal.reason);
+      controller.signal.addEventListener("abort", onWaitAborted, { once: true });
+    });
+    // One timer owns the entire wait, not each long-poll attempt.
+    const timer = setTimeout(() => {
+      controller.abort(
+        new TimeoutError(
+          `Timed out waiting for orchestration '${req.getInstanceid()}' to ${target} after ${timeout}s`,
+        ),
+      );
+    }, timeoutMs);
+
+    const method =
+      target === "start"
+        ? this._stub.waitForInstanceStart.bind(this._stub)
+        : this._stub.waitForInstanceCompletion.bind(this._stub);
+    const poll = async (): Promise<pb.GetInstanceResponse> => {
+      const backoff = new ExponentialBackoff({ initialDelayMs: 100, maxDelayMs: 1000, jitterFactor: 0 });
+      while (true) {
+        if (controller.signal.aborted) {
+          throw controller.signal.reason;
+        }
+        // Credential/metadata failures are not remote wait deadlines and must not be retried.
+        const metadata = this._metadataGenerator ? await this._metadataGenerator() : new grpc.Metadata();
+        try {
+          return await callWithMetadata(method, req, async () => metadata, controller.signal);
+        } catch (error) {
+          if (controller.signal.aborted) {
+            throw controller.signal.reason;
+          }
+          if (
+            target !== "complete" ||
+            !(error instanceof Error) ||
+            !("code" in error) ||
+            error.code !== grpc.status.DEADLINE_EXCEEDED
+          ) {
+            throw error;
+          }
+          await backoff.wait(controller.signal);
+        }
+      }
+    };
+
+    try {
+      // Metadata generators cannot be cancelled, so also race them against the wait's signal.
+      return await Promise.race([poll(), aborted]);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      controller.signal.removeEventListener("abort", onWaitAborted);
+    }
   }
 
   /**
