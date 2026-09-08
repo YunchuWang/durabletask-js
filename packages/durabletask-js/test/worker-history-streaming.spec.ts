@@ -43,7 +43,9 @@ describe("Worker history streaming over gRPC", () => {
   let historyCalls: HistoryCall[];
   let responses: pb.OrchestratorResponse[];
   let abandonments: pb.AbandonOrchestrationTaskRequest[];
+  let abandonmentMetadata: grpc.Metadata[];
   let onHistory: (call: HistoryCall) => void;
+  let onAbandon: stubs.ITaskHubSidecarServiceServer["abandonTaskOrchestratorWorkItem"];
   let historySpy: jest.SpyInstance;
 
   beforeAll(() => {
@@ -62,7 +64,9 @@ describe("Worker history streaming over gRPC", () => {
     historyCalls = [];
     responses = [];
     abandonments = [];
+    abandonmentMetadata = [];
     onHistory = (call) => call.end();
+    onAbandon = (_call, callback) => callback(null, new pb.AbandonOrchestrationTaskResponse());
     historySpy = jest.spyOn(stubs.TaskHubSidecarServiceClient.prototype, "streamInstanceHistory");
     server = new grpc.Server();
     const service = {
@@ -81,7 +85,8 @@ describe("Worker history streaming over gRPC", () => {
       },
       abandonTaskOrchestratorWorkItem: (call, callback) => {
         abandonments.push(call.request);
-        callback(null, new pb.AbandonOrchestrationTaskResponse());
+        abandonmentMetadata.push(call.metadata);
+        onAbandon(call, callback);
       },
     } satisfies Pick<
       stubs.ITaskHubSidecarServiceServer,
@@ -314,6 +319,8 @@ describe("Worker history streaming over gRPC", () => {
   it.each([grpc.status.UNAVAILABLE, grpc.status.CANCELLED])(
     "abandons incomplete history on gRPC status %s",
     async (code) => {
+      const abandon = jest.fn(worker["_abandonOrchestrationWorkItem"].bind(worker));
+      worker["_abandonOrchestrationWorkItem"] = abandon;
       const orchestrator = jest.fn(async function shouldNotExecute() {
         return "incorrect";
       });
@@ -336,6 +343,10 @@ describe("Worker history streaming over gRPC", () => {
       expect(chunksReceived).toBe(1);
       expect(orchestrator).not.toHaveBeenCalled();
       expect(abandonments.map((item) => item.getCompletiontoken())).toEqual(["history-token"]);
+      expect(abandon).toHaveBeenCalledTimes(1);
+      expect(abandon).toHaveBeenCalledWith(worker["_stub"], "history-token", worker["_abortController"]!.signal);
+      expect(abandonmentMetadata[0].get("taskhub")).toEqual(["history-test"]);
+      expect(abandonmentMetadata[0].get("authorization")).toEqual(["test-token"]);
       expect(exporter.getFinishedSpans()).toHaveLength(0);
       expectStreamCleanedUp();
 
@@ -354,6 +365,8 @@ describe("Worker history streaming over gRPC", () => {
   it.each([VersionFailureStrategy.Reject, VersionFailureStrategy.Fail])(
     "checks streamed versions before dispatch (strategy=%s)",
     async (failureStrategy) => {
+      const abandon = jest.fn(worker["_abandonOrchestrationWorkItem"].bind(worker));
+      worker["_abandonOrchestrationWorkItem"] = abandon;
       worker["_versioning"] = { version: "1", matchStrategy: VersionMatchStrategy.Strict, failureStrategy };
       onHistory = (call) => {
         call.write(
@@ -370,13 +383,42 @@ describe("Worker history streaming over gRPC", () => {
       expect(execute).not.toHaveBeenCalled();
       if (failureStrategy === VersionFailureStrategy.Reject) {
         expect(abandonments[0].getCompletiontoken()).toBe("history-token");
+        expect(abandon).toHaveBeenCalledTimes(1);
+        expect(abandon).toHaveBeenCalledWith(worker["_stub"], "history-token");
+        expect(abandonmentMetadata[0].get("taskhub")).toEqual(["history-test"]);
+        expect(abandonmentMetadata[0].get("authorization")).toEqual(["test-token"]);
       } else {
+        expect(abandon).not.toHaveBeenCalled();
         expect(responses[0].getActionsList()[0].getCompleteorchestration()!.getFailuredetails()!.getErrortype()).toBe(
           "VersionMismatch",
         );
       }
     },
   );
+
+  it("cancels history-failure abandonment on stop without waiting for a late response", async () => {
+    let completeAbandon!: () => void;
+    onAbandon = (_call, callback) => {
+      completeAbandon = () => callback(null, new pb.AbandonOrchestrationTaskResponse());
+    };
+    const abandon = jest.spyOn(stubs.TaskHubSidecarServiceClient.prototype, "abandonTaskOrchestratorWorkItem");
+    const execute = jest.spyOn(OrchestrationExecutor.prototype, "execute");
+    await start();
+    send(request());
+    await waitFor(() => abandonments.length > 0);
+    const call = abandon.mock.results[0].value as grpc.ClientUnaryCall;
+    const cancel = jest.spyOn(call, "cancel");
+    worker["_shutdownTimeoutMs"] = 50;
+    await worker.stop();
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(worker["_pendingWorkItems"].size).toBe(0);
+    expect(worker["_historyCancellations"].size).toBe(0);
+    expect(execute).not.toHaveBeenCalled();
+    expect(responses).toHaveLength(0);
+    completeAbandon();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(responses).toHaveLength(0);
+  });
 
   it("cancels outstanding history on stop without executing or leaving pending work", async () => {
     let cancelled = false;

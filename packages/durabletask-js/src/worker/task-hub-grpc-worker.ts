@@ -925,6 +925,16 @@ export class TaskHubGrpcWorker {
     });
   }
 
+  private async _abandonOrchestrationWorkItem(
+    stub: stubs.TaskHubSidecarServiceClient,
+    completionToken: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const request = new pb.AbandonOrchestrationTaskRequest();
+    request.setCompletiontoken(completionToken);
+    await callWithMetadata(stub.abandonTaskOrchestratorWorkItem.bind(stub), request, this._metadataGenerator, signal);
+  }
+
   private async _streamOrchestrationHistory(
     req: pb.OrchestratorRequest,
     stub: stubs.TaskHubSidecarServiceClient,
@@ -1008,15 +1018,8 @@ export class TaskHubGrpcWorker {
         // Incomplete history is a work-item transport failure, not an orchestration failure.
         // Do not replay or persist any actions; the backend can redeliver the work item.
         if (!signal?.aborted) {
-          const abandonRequest = new pb.AbandonOrchestrationTaskRequest();
-          abandonRequest.setCompletiontoken(completionToken);
           try {
-            await callWithMetadata(
-              stub.abandonTaskOrchestratorWorkItem.bind(stub),
-              abandonRequest,
-              this._metadataGenerator,
-              signal,
-            );
+            await this._abandonOrchestrationWorkItem(stub, completionToken, signal);
           } catch (abandonError) {
             WorkerLogs.completionError(
               this._logger,
@@ -1077,13 +1080,7 @@ export class TaskHubGrpcWorker {
         );
 
         try {
-          const abandonRequest = new pb.AbandonOrchestrationTaskRequest();
-          abandonRequest.setCompletiontoken(completionToken);
-          await callWithMetadata(
-            stub.abandonTaskOrchestratorWorkItem.bind(stub),
-            abandonRequest,
-            this._metadataGenerator,
-          );
+          await this._abandonOrchestrationWorkItem(stub, completionToken);
         } catch (e: unknown) {
           const error = e instanceof Error ? e : new Error(String(e));
           WorkerLogs.completionError(this._logger, instanceId, error);
