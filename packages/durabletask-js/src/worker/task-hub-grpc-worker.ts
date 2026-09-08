@@ -911,6 +911,16 @@ export class TaskHubGrpcWorker {
     this._pendingWorkItems.add(handledPromise);
   }
 
+  private async _abandonOrchestrationWorkItem(
+    stub: stubs.TaskHubSidecarServiceClient,
+    completionToken: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const request = new pb.AbandonOrchestrationTaskRequest();
+    request.setCompletiontoken(completionToken);
+    await callWithMetadata(stub.abandonTaskOrchestratorWorkItem.bind(stub), request, this._metadataGenerator, signal);
+  }
+
   /**
    * Executes an orchestrator request and tracks it as a pending work item.
    */
@@ -923,16 +933,6 @@ export class TaskHubGrpcWorker {
     this._trackPendingWorkItem(workPromise, (error) => {
       WorkerLogs.executionError(this._logger, req.getInstanceid() || "(unknown)", error);
     });
-  }
-
-  private async _abandonOrchestrationWorkItem(
-    stub: stubs.TaskHubSidecarServiceClient,
-    completionToken: string,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const request = new pb.AbandonOrchestrationTaskRequest();
-    request.setCompletiontoken(completionToken);
-    await callWithMetadata(stub.abandonTaskOrchestratorWorkItem.bind(stub), request, this._metadataGenerator, signal);
   }
 
   private async _streamOrchestrationHistory(
