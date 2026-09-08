@@ -28,6 +28,8 @@ describe("Client waits over real gRPC", () => {
   let handler: grpc.handleUnaryCall<pb.GetInstanceRequest, pb.GetInstanceResponse>;
   let calls: WaitCall[];
   let metadataCalls: number;
+  let abortOnStart: (() => void) | undefined;
+  let cancellations: number;
 
   beforeAll(async () => {
     const dispatch: grpc.handleUnaryCall<pb.GetInstanceRequest, pb.GetInstanceResponse> = (call, callback) => {
@@ -46,6 +48,21 @@ describe("Client waits over real gRPC", () => {
     });
     client = new TaskHubGrpcClient({
       hostAddress: `127.0.0.1:${port}`,
+      options: {
+        interceptors: [
+          (options: grpc.InterceptorOptions, nextCall: grpc.NextCall) =>
+            new grpc.InterceptingCall(nextCall(options), {
+              start: (metadata, listener, next) => {
+                abortOnStart?.();
+                next(metadata, listener);
+              },
+              cancel: (next) => {
+                cancellations++;
+                next();
+              },
+            }),
+        ],
+      },
       logger: new NoOpLogger(),
       metadataGenerator: async () => {
         const metadata = new grpc.Metadata();
@@ -59,6 +76,8 @@ describe("Client waits over real gRPC", () => {
   beforeEach(() => {
     calls = [];
     metadataCalls = 0;
+    abortOnStart = undefined;
+    cancellations = 0;
   });
 
   afterAll(async () => {
@@ -67,6 +86,25 @@ describe("Client waits over real gRPC", () => {
   });
 
   describe.each(["waitForOrchestrationStart", "waitForOrchestrationCompletion"] as const)("%s", (method) => {
+    it("cancels a real RPC aborted synchronously inside interceptor.start", async () => {
+      const controller = new AbortController();
+      const reason = new Error("synchronous interceptor abort");
+      abortOnStart = () => controller.abort(reason);
+      handler = () => {};
+      await expect(client[method]("grpc-instance", true, 1, controller.signal)).rejects.toBe(reason);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(cancellations).toBe(1);
+      // Cancellation may prevent dispatch entirely or cancel an already-dispatched call.
+      expect(calls.every((call) => call.cancelled)).toBe(true);
+
+      abortOnStart = undefined;
+      handler = (_call, callback) => callback(null, completedResponse());
+      await expect(client[method]("grpc-instance", true, 5)).resolves.toMatchObject({
+        serializedOutput: '"recovered"',
+      });
+      expect(cancellations).toBe(1);
+    });
+
     it.each(["abort", "timeout"] as const)(
       "cancels the server-observed RPC on %s and permits a subsequent wait",
       async (cause) => {

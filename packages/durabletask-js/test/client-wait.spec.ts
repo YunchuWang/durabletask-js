@@ -114,6 +114,28 @@ describe.each([
     expect(jest.getTimerCount()).toBe(0);
   });
 
+  it("cancels exactly once when aborted before the RPC returns its handle", async () => {
+    const controller = new AbortController();
+    const reason = new Error("synchronous interceptor abort");
+    rpc.mockImplementation((_req, _metadata, cb) => {
+      callback = cb;
+      controller.abort(reason);
+      return call;
+    });
+    cancel.mockImplementation(() => callback(grpcError(grpc.status.CANCELLED), new pb.GetInstanceResponse()));
+
+    const result = wait("instance", undefined, 1, controller.signal);
+    await expect(result).rejects.toBe(reason);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    callback(null, completedResponse());
+    callback(grpcError(grpc.status.DEADLINE_EXCEEDED), new pb.GetInstanceResponse());
+    await expect(result).rejects.toBe(reason);
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   it.each(["abort", "timeout"] as const)(
     "settles during pending metadata on %s without starting a late RPC",
     async (cause) => {
