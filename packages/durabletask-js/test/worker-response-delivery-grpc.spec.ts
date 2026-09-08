@@ -172,6 +172,77 @@ describe("Worker response delivery over gRPC", () => {
     expect(logger.error).toHaveBeenCalledTimes(1);
   });
 
+  it("retries explicit-signal abandonment with the same completion token", async () => {
+    const requests: pb.AbandonOrchestrationTaskRequest[] = [];
+    await startWorker({
+      abandonTaskOrchestratorWorkItem: (call, callback) => {
+        requests.push(call.request);
+        call.sendMetadata(new grpc.Metadata());
+        if (requests.length === 1) callback(grpcError(grpc.status.INTERNAL));
+        else callback(null, new pb.AbandonOrchestrationTaskResponse());
+      },
+    });
+    const controller = new AbortController();
+    await withTimeout(
+      worker!["_abandonOrchestrationWorkItem"](worker!["_stub"]!, "explicit-abandon-token", controller.signal),
+      5000,
+    );
+    expect(requests).toHaveLength(2);
+    expect(requests[1].serializeBinary()).toEqual(requests[0].serializeBinary());
+    expect(requests[1].getCompletiontoken()).toBe("explicit-abandon-token");
+    expect(activity).not.toHaveBeenCalled();
+  });
+
+  it.each(["metadata", "RPC"])("explicit abandonment cancellation stops initial %s immediately", async (phase) => {
+    const metadata = deferred<grpc.Metadata>();
+    const started = deferred();
+    const cancelled = deferred();
+    let holdMetadata = false;
+    await startWorker(
+      {
+        abandonTaskOrchestratorWorkItem: (call) => {
+          call.once("cancelled", () => cancelled.resolve());
+          started.resolve();
+        },
+      },
+      {
+        metadataGenerator: async () => {
+          if (holdMetadata) {
+            started.resolve();
+            return metadata.promise;
+          }
+          return new grpc.Metadata();
+        },
+      },
+    );
+    holdMetadata = phase === "metadata";
+    const send = jest.spyOn(worker!["_stub"]!, "abandonTaskOrchestratorWorkItem");
+    const controller = new AbortController();
+    const reason = new Error("abandonment cancelled");
+    const delivery = worker!["_abandonOrchestrationWorkItem"](
+      worker!["_stub"]!,
+      "explicit-abandon-token",
+      controller.signal,
+    );
+    const rejection = expect(delivery).rejects.toBe(reason);
+    try {
+      await withTimeout(started.promise, 5000);
+      controller.abort(reason);
+      await withTimeout(rejection, 1000, "Initial abandonment did not observe the explicit signal");
+      if (phase === "RPC") await withTimeout(cancelled.promise, 5000);
+      expect(worker!["_completionAbortController"]!.signal.aborted).toBe(false);
+      expect(worker!["_abortController"]!.signal.aborted).toBe(false);
+      metadata.resolve(new grpc.Metadata());
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(send).toHaveBeenCalledTimes(phase === "metadata" ? 0 : 1);
+      expect(activity).not.toHaveBeenCalled();
+    } finally {
+      controller.abort(reason);
+      metadata.resolve(new grpc.Metadata());
+      await rejection;
+    }
+  });
+
   it("bounds SDK delivery to ten attempts while preserving configured transport retries", async () => {
     const wait = ExponentialBackoff.prototype.wait;
     jest.spyOn(ExponentialBackoff.prototype, "wait").mockImplementation(function (

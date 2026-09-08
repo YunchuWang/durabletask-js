@@ -949,6 +949,7 @@ export class TaskHubGrpcWorker {
     stub: stubs.TaskHubSidecarServiceClient,
     method: Parameters<typeof callWithMetadata<TReq, TRes>>[0],
     request: TReq,
+    signal?: AbortSignal,
   ): Promise<TRes> {
     const signals = this._responseDeliverySignals.get(stub);
     const backoff = new ExponentialBackoff({
@@ -960,9 +961,9 @@ export class TaskHubGrpcWorker {
     });
     for (;;) {
       try {
-        // Let draining work send its initial response; stop() cancels retries immediately.
-        const signal = backoff.attemptCount === 0 ? signals?.completion : signals?.retry;
-        return await callWithMetadata(method, request, this._metadataGenerator, signal);
+        // Default initial delivery can drain; an explicit signal cancels every attempt.
+        const attemptSignal = signal ?? (backoff.attemptCount === 0 ? signals?.completion : signals?.retry);
+        return await callWithMetadata(method, request, this._metadataGenerator, attemptSignal);
       } catch (error) {
         const status = error instanceof Error ? this._getGrpcStatus(error) : undefined;
         if (
@@ -974,9 +975,19 @@ export class TaskHubGrpcWorker {
         ) {
           throw error;
         }
-        await backoff.wait(signals?.retry);
+        await backoff.wait(signal ?? signals?.retry);
       }
     }
+  }
+
+  private async _abandonOrchestrationWorkItem(
+    stub: stubs.TaskHubSidecarServiceClient,
+    completionToken: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const request = new pb.AbandonOrchestrationTaskRequest();
+    request.setCompletiontoken(completionToken);
+    await this._deliverResponse(stub, stub.abandonTaskOrchestratorWorkItem.bind(stub), request, signal);
   }
 
   /**
@@ -1055,9 +1066,7 @@ export class TaskHubGrpcWorker {
         );
 
         try {
-          const abandonRequest = new pb.AbandonOrchestrationTaskRequest();
-          abandonRequest.setCompletiontoken(completionToken);
-          await this._deliverResponse(stub, stub.abandonTaskOrchestratorWorkItem.bind(stub), abandonRequest);
+          await this._abandonOrchestrationWorkItem(stub, completionToken);
         } catch (e: unknown) {
           const error = e instanceof Error ? e : new Error(String(e));
           WorkerLogs.completionError(this._logger, instanceId, error);

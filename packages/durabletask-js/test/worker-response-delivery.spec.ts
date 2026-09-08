@@ -205,6 +205,69 @@ describe("Worker response delivery", () => {
     expect(method).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["initial metadata", "initial RPC", "backoff", "retry metadata", "retry RPC"])(
+    "uses an explicit delivery signal during %s",
+    async (phase) => {
+      let resolveMetadata!: (metadata: grpc.Metadata) => void;
+      const heldMetadata = new Promise<grpc.Metadata>((resolve) => (resolveMetadata = resolve));
+      let metadataCalls = 0;
+      const metadataGenerator = jest.fn(async () => {
+        metadataCalls++;
+        if (phase === "initial metadata" || (phase === "retry metadata" && metadataCalls === 2)) {
+          return heldMetadata;
+        }
+        return new grpc.Metadata();
+      });
+      const worker = new TaskHubGrpcWorker({ logger: new NoOpLogger(), metadataGenerator });
+      const completion = new AbortController();
+      const retry = new AbortController();
+      const explicit = new AbortController();
+      worker["_responseDeliverySignals"].set(stub, { completion: completion.signal, retry: retry.signal });
+      const cancel = jest.fn();
+      let attempts = 0;
+      const method = (_req: pb.ActivityResponse, _metadata: grpc.Metadata, callback: CompleteCallback) => {
+        if (++attempts === 1 && (phase === "backoff" || phase.startsWith("retry"))) {
+          callback(grpcError(grpc.status.INTERNAL), new pb.CompleteTaskResponse());
+        }
+        return unaryCall(cancel);
+      };
+      let settled = false;
+      let error: unknown;
+      const delivery = worker["_deliverResponse"](stub, method, new pb.ActivityResponse(), explicit.signal).then(
+        () => (settled = true),
+        (reason: unknown) => {
+          error = reason;
+          settled = true;
+        },
+      );
+      try {
+        await jest.advanceTimersByTimeAsync(phase.startsWith("retry") ? 200 : 0);
+        const sent = attempts;
+        const reason = new Error("explicitly stopped");
+        explicit.abort(reason);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(true);
+        expect(error).toBe(reason);
+        expect(completion.signal.aborted).toBe(false);
+        expect(retry.signal.aborted).toBe(false);
+        resolveMetadata(new grpc.Metadata());
+        await jest.runAllTimersAsync();
+        expect(attempts).toBe(sent);
+        expect(cancel).toHaveBeenCalledTimes(phase.endsWith("RPC") ? 1 : 0);
+        expect(getEventListeners(explicit.signal, "abort")).toHaveLength(0);
+        expect(getEventListeners(completion.signal, "abort")).toHaveLength(0);
+        expect(getEventListeners(retry.signal, "abort")).toHaveLength(0);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        completion.abort();
+        retry.abort();
+        resolveMetadata(new grpc.Metadata());
+        await jest.runAllTimersAsync();
+        await delivery;
+      }
+    },
+  );
+
   it.each(["initial", "retry"] as const)("cancels pending %s metadata at its shutdown boundary", async (phase) => {
     let resolveMetadata!: (metadata: grpc.Metadata) => void;
     const heldMetadata = new Promise<grpc.Metadata>((resolve) => (resolveMetadata = resolve));
