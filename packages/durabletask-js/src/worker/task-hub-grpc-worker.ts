@@ -114,6 +114,7 @@ export class TaskHubGrpcWorker {
   private _stub: stubs.TaskHubSidecarServiceClient | null;
   private _logger: Logger;
   private _pendingWorkItems: Set<Promise<void>>;
+  private _historyCancellations: Set<() => void>;
   private _shutdownTimeoutMs: number;
   private _silentDisconnectTimeoutMs: number;
   private _silentDisconnectTimer: ReturnType<typeof setTimeout> | null;
@@ -214,6 +215,7 @@ export class TaskHubGrpcWorker {
     this._stub = null;
     this._logger = resolvedLogger ?? new ConsoleLogger();
     this._pendingWorkItems = new Set();
+    this._historyCancellations = new Set();
     this._shutdownTimeoutMs = resolvedShutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     const silentDisconnectTimeoutMs = resolvedSilentDisconnectTimeoutMs ?? DEFAULT_SILENT_DISCONNECT_TIMEOUT_MS;
     if (!Number.isFinite(silentDisconnectTimeoutMs)) {
@@ -717,6 +719,9 @@ export class TaskHubGrpcWorker {
     const responseStream = this._responseStream;
     this._stopWorker = true;
     this._abortController?.abort();
+    for (const cancel of this._historyCancellations) {
+      cancel();
+    }
     this._clearSilentDisconnectTimer();
 
     const streamClosed = responseStream
@@ -789,6 +794,7 @@ export class TaskHubGrpcWorker {
    */
   private _buildGetWorkItemsRequest(): pb.GetWorkItemsRequest {
     const request = new pb.GetWorkItemsRequest();
+    request.setCapabilitiesList([pb.WorkerCapability.WORKER_CAPABILITY_HISTORY_STREAMING]);
     request.setMaxconcurrentactivityworkitems(
       Math.min(this._concurrency.maximumConcurrentActivityWorkItems, MAX_PROTOCOL_CONCURRENCY),
     );
@@ -919,6 +925,59 @@ export class TaskHubGrpcWorker {
     });
   }
 
+  private async _streamOrchestrationHistory(
+    req: pb.OrchestratorRequest,
+    stub: stubs.TaskHubSidecarServiceClient,
+    signal?: AbortSignal,
+  ): Promise<pb.HistoryEvent[]> {
+    const request = new pb.StreamInstanceHistoryRequest();
+    request.setInstanceid(req.getInstanceid());
+    request.setExecutionid(req.getExecutionid());
+    request.setForworkitemprocessing(true);
+    return new Promise<pb.HistoryEvent[]>((resolve, reject) => {
+      const events: pb.HistoryEvent[] = [];
+      let stream: grpc.ClientReadableStream<pb.HistoryChunk> | undefined;
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        stream?.removeListener("data", onData);
+        stream?.removeListener("end", onEnd);
+        stream?.removeListener("error", onError);
+        stream?.removeListener("close", onClose);
+        this._historyCancellations.delete(cancel);
+        stream?.destroy();
+        if (error) reject(error);
+        else resolve(events);
+      };
+      const onData = (chunk: pb.HistoryChunk) => {
+        for (const event of chunk.getEventsList()) {
+          events.push(event);
+        }
+      };
+      const onEnd = () => finish();
+      const onError = (error: unknown) => finish(error instanceof Error ? error : new Error(String(error)));
+      const onClose = () => finish(new Error("Orchestration history stream closed before all history was received."));
+      const cancel = () => {
+        if (stream) stream.cancel();
+        else finish(new Error("Orchestration history hydration was cancelled."));
+      };
+      // Track metadata acquisition too: a stalled token refresh must not outlive shutdown.
+      this._historyCancellations.add(cancel);
+      this._getMetadata()
+        .then((metadata) => {
+          if (settled) return;
+          signal?.throwIfAborted();
+          stream = stub.streamInstanceHistory(request, metadata);
+          stream.on("data", onData);
+          stream.once("end", onEnd);
+          stream.once("error", onError);
+          stream.once("close", onClose);
+        })
+        .catch(onError);
+    });
+  }
+
   /**
    * Internal implementation of orchestrator execution.
    */
@@ -931,6 +990,37 @@ export class TaskHubGrpcWorker {
 
     if (!instanceId) {
       throw new Error(`Could not execute the orchestrator as the instanceId was not provided (${instanceId})`);
+    }
+
+    if (req.getRequireshistorystreaming()) {
+      const signal = this._abortController?.signal;
+      try {
+        const pastEvents = await this._streamOrchestrationHistory(req, stub, signal);
+        signal?.throwIfAborted();
+        req.setPasteventsList(pastEvents);
+      } catch (error) {
+        // Incomplete history is a work-item transport failure, not an orchestration failure.
+        // Do not replay or persist any actions; the backend can redeliver the work item.
+        if (!signal?.aborted) {
+          const abandonRequest = new pb.AbandonOrchestrationTaskRequest();
+          abandonRequest.setCompletiontoken(completionToken);
+          try {
+            await callWithMetadata(
+              stub.abandonTaskOrchestratorWorkItem.bind(stub),
+              abandonRequest,
+              this._metadataGenerator,
+              signal,
+            );
+          } catch (abandonError) {
+            WorkerLogs.completionError(
+              this._logger,
+              instanceId,
+              abandonError instanceof Error ? abandonError : new Error(String(abandonError)),
+            );
+          }
+        }
+        throw error;
+      }
     }
 
     // Check version compatibility if versioning is enabled

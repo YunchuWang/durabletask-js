@@ -2,6 +2,9 @@
 
 ### New
 
+- Add worker history streaming: hydrate service-selected history before version checks,
+  tracing, and replay. Cancel history streams on shutdown and abandon incomplete
+  work items on transport errors instead of failing the orchestration.
 - Add `ConcurrencyOptions` to configure the orchestration, activity, and entity concurrency
   hints sent by `TaskHubGrpcWorker` to the backend.
 - Add an optional `newVersion` parameter to `OrchestrationContext.continueAsNew()` for version migrations.
