@@ -24,7 +24,10 @@ function unaryCall(cancel = jest.fn()): grpc.ClientUnaryCall {
   return Object.assign(new EventEmitter(), { cancel, getPeer: () => "test", getAuthContext: () => null });
 }
 
-type CompleteCallback = (error: grpc.ServiceError | null, response: pb.CompleteTaskResponse) => void;
+type CompleteCallback<TResponse = pb.CompleteTaskResponse> = (
+  error: grpc.ServiceError | null,
+  response: TResponse,
+) => void;
 
 function createLogger() {
   return { error: jest.fn(), warn: jest.fn(), info: jest.fn(), debug: jest.fn() };
@@ -488,12 +491,16 @@ describe("Worker response delivery", () => {
           (
             response,
             _metadata,
-            optionsOrCallback: Partial<grpc.CallOptions> | CompleteCallback,
-            callback?: CompleteCallback,
+            optionsOrCallback:
+              | Partial<grpc.CallOptions>
+              | CompleteCallback<pb.CompleteTaskResponse | pb.AbandonOrchestrationTaskResponse>,
+            callback?: CompleteCallback<pb.CompleteTaskResponse | pb.AbandonOrchestrationTaskResponse>,
           ) => {
             requests.push(response);
             const respond = typeof optionsOrCallback === "function" ? optionsOrCallback : callback!;
-            respond(requests.length === 1 ? grpcError(grpc.status.INTERNAL) : null, new pb.CompleteTaskResponse());
+            const result =
+              kind === "abandon" ? new pb.AbandonOrchestrationTaskResponse() : new pb.CompleteTaskResponse();
+            respond(requests.length === 1 ? grpcError(grpc.status.INTERNAL) : null, result);
             return unaryCall();
           },
         );
