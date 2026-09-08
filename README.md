@@ -107,6 +107,27 @@ reconnected work-item streams.
 
 You can find more samples in the [examples/azure-managed](./examples/azure-managed) directory.
 
+### Worker response delivery
+
+Workers retry completion responses for orchestrations, activities, and entities, including
+version-mismatch failure and abandon responses. The policy follows the .NET worker: ten total
+attempts for `UNAVAILABLE`, `UNKNOWN`, `DEADLINE_EXCEEDED`, or `INTERNAL`, with exponential
+backoff starting at 200 ms, capped at 15 seconds before adding 0-20% jitter. Other errors and
+exhausted attempts are reported through the existing worker error logs.
+
+Only delivery is retried: the response and completion token are reused, not the user code.
+This does not change the backend's at-least-once work-item delivery contract; a backend may
+redeliver work after a lock expires or an acknowledgement is lost.
+
+`stop()` cancels retry delays and retried RPCs. Already-running work can still send its first
+completion during the existing graceful-shutdown window (`shutdownTimeoutMs`, default 30 seconds);
+remaining completion RPCs are cancelled when that window expires. Replaced worker channels stay
+open until their pending work finishes or shutdown forces cleanup.
+
+To avoid multiplying retry budgets, worker-created channels disable gRPC transport retries even
+when channel options or an Azure-managed service config enable them. The worker's own hello/stream
+reconnect loop remains active. Client channels and Azure-managed client retry configuration are unchanged.
+
 ### Reusing orchestration instance IDs
 
 Set the top-level `dedupeStatuses` start option when an instance ID may be reused. The list

@@ -229,13 +229,15 @@ describe("TaskHubGrpcWorker startup", () => {
     await failStream(streams[1]);
 
     expect(clientOptions).toEqual([
-      { "grpc.keepalive_time_ms": 1234 },
+      { "grpc.keepalive_time_ms": 1234, "grpc.enable_retries": 0 },
       {
         "grpc.keepalive_time_ms": 1234,
+        "grpc.enable_retries": 0,
         "grpc.use_local_subchannel_pool": 1,
       },
       {
         "grpc.keepalive_time_ms": 1234,
+        "grpc.enable_retries": 0,
         "grpc.use_local_subchannel_pool": 1,
       },
     ]);
