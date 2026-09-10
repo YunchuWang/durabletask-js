@@ -911,16 +911,6 @@ export class TaskHubGrpcWorker {
     this._pendingWorkItems.add(handledPromise);
   }
 
-  private async _abandonOrchestrationWorkItem(
-    stub: stubs.TaskHubSidecarServiceClient,
-    completionToken: string,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const request = new pb.AbandonOrchestrationTaskRequest();
-    request.setCompletiontoken(completionToken);
-    await callWithMetadata(stub.abandonTaskOrchestratorWorkItem.bind(stub), request, this._metadataGenerator, signal);
-  }
-
   /**
    * Executes an orchestrator request and tracks it as a pending work item.
    */
@@ -1002,33 +992,40 @@ export class TaskHubGrpcWorker {
       throw new Error(`Could not execute the orchestrator as the instanceId was not provided (${instanceId})`);
     }
 
+    const historySignal = req.getRequireshistorystreaming() ? this._abortController?.signal : undefined;
     if (req.getRequireshistorystreaming()) {
-      const signal = this._abortController?.signal;
       try {
-        const pastEvents = await this._streamOrchestrationHistory(req, stub, signal);
-        signal?.throwIfAborted();
+        const pastEvents = await this._streamOrchestrationHistory(req, stub, historySignal);
+        historySignal?.throwIfAborted();
         if (
           !pastEvents.some((event) => event.hasExecutionstarted()) &&
           !req.getNeweventsList().some((event) => event.hasExecutionstarted())
         ) {
-          throw new Error("The provided orchestration history was incomplete (missing ExecutionStarted).");
+          throw new Error("The provided orchestration history was incomplete");
         }
         req.setPasteventsList(pastEvents);
-      } catch (error) {
-        // Incomplete history is a work-item transport failure, not an orchestration failure.
-        // Do not replay or persist any actions; the backend can redeliver the work item.
-        if (!signal?.aborted) {
-          try {
-            await this._abandonOrchestrationWorkItem(stub, completionToken, signal);
-          } catch (abandonError) {
-            WorkerLogs.completionError(
-              this._logger,
-              instanceId,
-              abandonError instanceof Error ? abandonError : new Error(String(abandonError)),
-            );
-          }
+      } catch (e: unknown) {
+        if (historySignal?.aborted) return;
+        const error = e instanceof Error ? e : new Error(String(e));
+        WorkerLogs.executionError(this._logger, instanceId, error);
+        const res = new pb.OrchestratorResponse();
+        res.setInstanceid(instanceId);
+        res.setCompletiontoken(completionToken);
+        res.setActionsList([
+          pbh.newCompleteOrchestrationAction(
+            -1,
+            pb.OrchestrationStatus.ORCHESTRATION_STATUS_FAILED,
+            undefined,
+            pbh.newFailureDetails(error),
+          ),
+        ]);
+        try {
+          await callWithMetadata(stub.completeOrchestratorTask.bind(stub), res, this._metadataGenerator, historySignal);
+        } catch (e: unknown) {
+          const error = e instanceof Error ? e : new Error(String(e));
+          WorkerLogs.completionError(this._logger, instanceId, error);
         }
-        throw error;
+        return;
       }
     }
 
@@ -1064,7 +1061,7 @@ export class TaskHubGrpcWorker {
         res.setActionsList(actions);
 
         try {
-          await callWithMetadata(stub.completeOrchestratorTask.bind(stub), res, this._metadataGenerator);
+          await callWithMetadata(stub.completeOrchestratorTask.bind(stub), res, this._metadataGenerator, historySignal);
         } catch (e: unknown) {
           const error = e instanceof Error ? e : new Error(String(e));
           WorkerLogs.completionError(this._logger, instanceId, error);
@@ -1080,7 +1077,13 @@ export class TaskHubGrpcWorker {
         );
 
         try {
-          await this._abandonOrchestrationWorkItem(stub, completionToken);
+          const abandonRequest = new pb.AbandonOrchestrationTaskRequest();
+          abandonRequest.setCompletiontoken(completionToken);
+          await callWithMetadata(
+            stub.abandonTaskOrchestratorWorkItem.bind(stub),
+            abandonRequest,
+            this._metadataGenerator,
+          );
         } catch (e: unknown) {
           const error = e instanceof Error ? e : new Error(String(e));
           WorkerLogs.completionError(this._logger, instanceId, error);
@@ -1187,7 +1190,7 @@ export class TaskHubGrpcWorker {
     }
 
     try {
-      await callWithMetadata(stub.completeOrchestratorTask.bind(stub), res, this._metadataGenerator);
+      await callWithMetadata(stub.completeOrchestratorTask.bind(stub), res, this._metadataGenerator, historySignal);
     } catch (e: unknown) {
       const error = e instanceof Error ? e : new Error(String(e));
       WorkerLogs.completionError(this._logger, req.getInstanceid(), error);
