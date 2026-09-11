@@ -914,8 +914,7 @@ export class TaskHubGrpcWorker {
   private async _deliverResponse<TReq, TRes>(
     method: Parameters<typeof callWithMetadata<TReq, TRes>>[0],
     request: TReq,
-    retrySignal?: AbortSignal,
-    initialSignal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<TRes> {
     const backoff = new ExponentialBackoff({
       initialDelayMs: 200,
@@ -926,13 +925,7 @@ export class TaskHubGrpcWorker {
     });
     for (;;) {
       try {
-        // Initial responses drain during shutdown unless streamed history requires immediate cancellation.
-        return await callWithMetadata(
-          method,
-          request,
-          this._metadataGenerator,
-          backoff.attemptCount === 0 ? initialSignal : retrySignal,
-        );
+        return await callWithMetadata(method, request, this._metadataGenerator, signal);
       } catch (error) {
         const status = error instanceof Error ? this._getGrpcStatus(error) : undefined;
         if (
@@ -944,7 +937,7 @@ export class TaskHubGrpcWorker {
         ) {
           throw error;
         }
-        await backoff.wait(retrySignal);
+        await backoff.wait(signal);
       }
     }
   }
@@ -1032,11 +1025,10 @@ export class TaskHubGrpcWorker {
       throw new Error(`Could not execute the orchestrator as the instanceId was not provided (${instanceId})`);
     }
 
-    const historySignal = req.getRequireshistorystreaming() ? retrySignal : undefined;
     if (req.getRequireshistorystreaming()) {
       try {
-        const pastEvents = await this._streamOrchestrationHistory(req, stub, historySignal);
-        historySignal?.throwIfAborted();
+        const pastEvents = await this._streamOrchestrationHistory(req, stub, retrySignal);
+        retrySignal?.throwIfAborted();
         if (
           !pastEvents.some((event) => event.hasExecutionstarted()) &&
           !req.getNeweventsList().some((event) => event.hasExecutionstarted())
@@ -1045,7 +1037,7 @@ export class TaskHubGrpcWorker {
         }
         req.setPasteventsList(pastEvents);
       } catch (e: unknown) {
-        if (historySignal?.aborted) return;
+        if (retrySignal?.aborted) return;
         const error = e instanceof Error ? e : new Error(String(e));
         WorkerLogs.executionError(this._logger, instanceId, error);
         const res = new pb.OrchestratorResponse();
@@ -1060,7 +1052,7 @@ export class TaskHubGrpcWorker {
           ),
         ]);
         try {
-          await this._deliverResponse(stub.completeOrchestratorTask.bind(stub), res, retrySignal, historySignal);
+          await this._deliverResponse(stub.completeOrchestratorTask.bind(stub), res, retrySignal);
         } catch (e: unknown) {
           const error = e instanceof Error ? e : new Error(String(e));
           WorkerLogs.completionError(this._logger, instanceId, error);
@@ -1101,7 +1093,7 @@ export class TaskHubGrpcWorker {
         res.setActionsList(actions);
 
         try {
-          await this._deliverResponse(stub.completeOrchestratorTask.bind(stub), res, retrySignal, historySignal);
+          await this._deliverResponse(stub.completeOrchestratorTask.bind(stub), res, retrySignal);
         } catch (e: unknown) {
           const error = e instanceof Error ? e : new Error(String(e));
           WorkerLogs.completionError(this._logger, instanceId, error);
@@ -1226,7 +1218,7 @@ export class TaskHubGrpcWorker {
     }
 
     try {
-      await this._deliverResponse(stub.completeOrchestratorTask.bind(stub), res, retrySignal, historySignal);
+      await this._deliverResponse(stub.completeOrchestratorTask.bind(stub), res, retrySignal);
     } catch (e: unknown) {
       const error = e instanceof Error ? e : new Error(String(e));
       WorkerLogs.completionError(this._logger, req.getInstanceid(), error);

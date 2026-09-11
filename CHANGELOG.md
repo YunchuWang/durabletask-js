@@ -19,6 +19,8 @@
 
 ### Fixes
 
+- Align worker response cancellation with .NET: `stop()` cancels initial sends as well
+  as retries and backoff for all work items. Work finishing after stop no longer sends a response.
 - Retry worker completion and version-rejection responses on transient gRPC failures, reusing
   the computed response without rerunning user code. Bound SDK sends to ten with shutdown-aware backoff.
 - Cancel pending client wait RPCs on timeout or cancellation without terminating the orchestration.
