@@ -9,6 +9,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 import * as pb from "../src/proto/orchestrator_service_pb";
 import * as stubs from "../src/proto/orchestrator_service_grpc_pb";
 import * as pbh from "../src/utils/pb-helper.util";
+import { ExponentialBackoff } from "../src/utils/backoff.util";
 import { NoOpLogger } from "../src/types/logger.type";
 import { OrchestrationContext } from "../src/task/context/orchestration-context";
 import { OrchestrationExecutor } from "../src/worker/orchestration-executor";
@@ -46,6 +47,7 @@ describe("Worker history streaming over gRPC", () => {
   let abandonments: pb.AbandonOrchestrationTaskRequest[];
   let abandonmentMetadata: grpc.Metadata[];
   let onHistory: (call: HistoryCall) => void;
+  let onComplete: stubs.ITaskHubSidecarServiceServer["completeOrchestratorTask"];
   let historySpy: jest.SpyInstance;
 
   beforeAll(() => {
@@ -67,6 +69,7 @@ describe("Worker history streaming over gRPC", () => {
     abandonments = [];
     abandonmentMetadata = [];
     onHistory = (call) => call.end();
+    onComplete = (_call, callback) => callback(null, new pb.CompleteTaskResponse());
     historySpy = jest.spyOn(stubs.TaskHubSidecarServiceClient.prototype, "streamInstanceHistory");
     server = new grpc.Server();
     const service = {
@@ -82,7 +85,7 @@ describe("Worker history streaming over gRPC", () => {
       completeOrchestratorTask: (call, callback) => {
         responses.push(call.request);
         responseMetadata.push(call.metadata);
-        callback(null, new pb.CompleteTaskResponse());
+        onComplete(call, callback);
       },
       abandonTaskOrchestratorWorkItem: (call, callback) => {
         abandonments.push(call.request);
@@ -494,6 +497,87 @@ describe("Worker history streaming over gRPC", () => {
       expect(historyCalls).toHaveLength(outcome === "history failure" ? 0 : 1);
     },
   );
+
+  it.each(["history failure", "orchestration completion", "version failure"])(
+    "retries the same streamed %s response without hydrating or executing again",
+    async (outcome) => {
+      const orchestrator = jest.fn(async () => "complete");
+      worker.addNamedOrchestrator("retryHistory", orchestrator);
+      onHistory = (call) => {
+        if (outcome !== "history failure") {
+          call.write(
+            chunk([pbh.newExecutionStartedEvent("retryHistory", instanceId, undefined, undefined, executionId, "2")]),
+          );
+        }
+        call.end();
+      };
+      if (outcome === "version failure") {
+        worker["_versioning"] = {
+          version: "1",
+          matchStrategy: VersionMatchStrategy.Strict,
+          failureStrategy: VersionFailureStrategy.Fail,
+        };
+      }
+      onComplete = (call, callback) => {
+        call.sendMetadata(new grpc.Metadata());
+        if (responses.length === 1) callback({ code: grpc.status.INTERNAL, message: "retry response" });
+        else callback(null, new pb.CompleteTaskResponse());
+      };
+      const complete = jest.spyOn(stubs.TaskHubSidecarServiceClient.prototype, "completeOrchestratorTask");
+      const execute = jest.spyOn(OrchestrationExecutor.prototype, "execute");
+      await start();
+      let metadataCalls = 0;
+      worker["_metadataGenerator"] = async () => {
+        const metadata = new grpc.Metadata();
+        metadata.set("attempt", String(++metadataCalls));
+        return metadata;
+      };
+      send(request());
+      await waitFor(() => responses.length > 0);
+      await settled();
+      expect(responses).toHaveLength(2);
+      expect(responses[1].serializeBinary()).toEqual(responses[0].serializeBinary());
+      expect(complete.mock.calls[1][0]).toBe(complete.mock.calls[0][0]);
+      expect(responses[1].getInstanceid()).toBe(instanceId);
+      expect(responses[1].getCompletiontoken()).toBe("history-token");
+      expect(responses[1].getActionsList()[0].getCompleteorchestration()!.getOrchestrationstatus()).toBe(
+        outcome === "orchestration completion"
+          ? pb.OrchestrationStatus.ORCHESTRATION_STATUS_COMPLETED
+          : pb.OrchestrationStatus.ORCHESTRATION_STATUS_FAILED,
+      );
+      expect(responseMetadata.map((metadata) => metadata.get("attempt"))).toEqual([["2"], ["3"]]);
+      expect(historyCalls).toHaveLength(1);
+      expect(execute).toHaveBeenCalledTimes(outcome === "orchestration completion" ? 1 : 0);
+      expect(orchestrator).toHaveBeenCalledTimes(outcome === "orchestration completion" ? 1 : 0);
+      expect(abandonments).toHaveLength(0);
+      expectStreamCleanedUp();
+    },
+  );
+
+  it.each(["initial RPC", "retry delay"])("stops history-failure delivery during %s", async (phase) => {
+    let cancelled = false;
+    onComplete = (call, callback) => {
+      if (phase === "retry delay") callback({ code: grpc.status.INTERNAL, message: "retry response" });
+      else {
+        call.on("cancelled", () => {
+          cancelled = true;
+          callback(null, new pb.CompleteTaskResponse());
+        });
+      }
+    };
+    const wait = jest.spyOn(ExponentialBackoff.prototype, "wait");
+    await start();
+    const signal = worker["_abortController"]!.signal;
+    send(request());
+    await waitFor(() => (phase === "initial RPC" ? responses.length > 0 : wait.mock.calls.length > 0));
+    await worker.stop();
+    await settled();
+    expect(responses).toHaveLength(1);
+    if (phase === "initial RPC") expect(cancelled).toBe(true);
+    else expect(wait).toHaveBeenCalledWith(signal);
+    expect(historyCalls).toHaveLength(1);
+    expect(abandonments).toHaveLength(0);
+  });
 
   it("uses the work item's captured stub when the worker channel is replaced", async () => {
     worker.addOrchestrator(async function capturedStub() {

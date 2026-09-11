@@ -125,6 +125,24 @@ reconnected work-item streams.
 
 You can find more samples in the [examples/azure-managed](./examples/azure-managed) directory.
 
+### Worker response delivery
+
+An activity can return `42` but fail to report that result because of a transient gRPC error.
+Workers retry the same completion response and token instead of running the activity again.
+If a resend is accepted, the backend can advance the workflow using the saved result.
+This also applies to orchestration and entity responses, including version-rejection responses.
+
+The policy follows the .NET worker: up to ten SDK sends for `UNAVAILABLE`, `UNKNOWN`,
+`DEADLINE_EXCEEDED`, or `INTERNAL`, with backoff starting at 200 ms, doubling to a 15-second
+cap before adding 0-20% jitter. Permanent errors and exhausted attempts use the existing
+error logs. Configured gRPC transport retries remain enabled, so ten SDK sends can involve
+more than ten network attempts.
+
+`stop()` cancels retry backoff and in-flight retry RPCs. Already-running work can still send
+its first response during the existing bounded shutdown wait; user code and metadata
+generation are not canceled. Channel retirement and backend lock durations are unchanged.
+Retries do not guarantee connection recovery, acceptance of expired tokens, or exactly-once execution.
+
 ### Reusing orchestration instance IDs
 
 Set the top-level `dedupeStatuses` start option when an instance ID may be reused. The list
